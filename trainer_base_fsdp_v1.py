@@ -40,12 +40,12 @@ from tqdm import tqdm, trange
 from transformers import (get_linear_schedule_with_warmup, AutoTokenizer, PreTrainedTokenizer)
 
 from general_util.logger import setting_logger
-from general_util.training_utils import batch_to_device, unwrap_model, set_seed, note_best_checkpoint, initialize_optimizer
+from general_util.training_utils import batch_to_device, unwrap_model, set_seed, note_best_checkpoint, initialize_optimizer, \
+    load_and_cache_examples
+from general_util.evaluator import evaluate
+from general_util.dist_utils import vanilla_torch_dist
 
 logger: logging.Logger
-
-
-# transformers.logging.set_verbosity_error()
 
 
 def save_model(model: Union[torch.nn.Module, FullyShardedDDP], cfg: DictConfig, output_dir: str, tokenizer: PreTrainedTokenizer = None):
@@ -273,96 +273,17 @@ def train(cfg, train_dataset, model, tokenizer, continue_from_global_step=0):
     return global_step, tr_loss / global_step
 
 
-def evaluate(cfg, model, tokenizer: PreTrainedTokenizer, prefix="", _split="dev"):
-    dataset = load_and_cache_examples(cfg, tokenizer, _split=_split)
-
-    if cfg.local_rank in [-1, 0] and not os.path.exists(os.path.join(cfg.output_dir, prefix)):
-        os.makedirs(os.path.join(cfg.output_dir, prefix))
-
-    cfg.eval_batch_size = cfg.per_gpu_eval_batch_size
-    if _split == 'dev' and cfg.ddp_eval:
-        eval_sampler = DistributedSampler(dataset, shuffle=False)
-    else:
-        eval_sampler = SequentialSampler(dataset)  # Note that DistributedSampler samples randomly
-
-    eval_collator = hydra.utils.instantiate(cfg.collator) if "collator" in cfg and cfg.collator else None
-    eval_dataloader = DataLoader(dataset,
-                                 sampler=eval_sampler,
-                                 batch_size=cfg.eval_batch_size,
-                                 collate_fn=eval_collator)
-
-    single_model_gpu = unwrap_model(model)
-    single_model_gpu.get_eval_log(reset=True)
-    # Eval!
-    torch.cuda.empty_cache()
-    logger.info("***** Running evaluation {}.{} *****".format(_split, prefix))
-    logger.info("  Num examples = %d", len(dataset))
-    logger.info("  Batch size = %d", cfg.eval_batch_size)
-    # Seems FSDP does not need to unwrap the model for evaluating.
-    model.eval()
-    pred_list = []
-    prob_list = []
-    for batch in tqdm(eval_dataloader, desc="Evaluating", disable=cfg.local_rank not in [-1, 0], dynamic_ncols=True):
-        batch = batch_to_device(batch, cfg.device)
-        with torch.cuda.amp.autocast():
-            with torch.no_grad():
-                outputs = model(**batch)
-                probs = outputs["logits"].softmax(dim=-1).detach().float().cpu()
-                prob, pred = probs.max(dim=-1)
-                pred_list.extend(pred.tolist())
-                prob_list.extend(prob.tolist())
-
-    metric_log, results = single_model_gpu.get_eval_log(reset=True, ddp=(_split == 'dev' and cfg.ddp_eval), device=cfg.device)
-    logger.info("****** Evaluation Results ******")
-    logger.info(f"Global Steps: {prefix}")
-    logger.info(metric_log)
-
-    if cfg.local_rank in [-1, 0]:
-        prediction_file = os.path.join(cfg.output_dir, prefix, "eval_predictions.npy")
-        np.save(prediction_file, pred_list)
-        json.dump(prob_list, open(os.path.join(cfg.output_dir, prefix, "eval_probs.json"), "w"))
-
-    return results
-
-
-def load_and_cache_examples(cfg, tokenizer: PreTrainedTokenizer, _split="train"):
-    if cfg.local_rank not in [-1, 0] and _split == "train":
-        dist.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
-
-    if _split == "train":
-        input_file = cfg.train_file
-    elif _split == "dev":
-        input_file = cfg.dev_file
-    elif _split == "test":
-        input_file = cfg.test_file
-    else:
-        raise RuntimeError(_split)
-
-    dataset = hydra.utils.call(cfg.read_tensor, file_path=input_file, tokenizer=tokenizer)
-
-    if cfg.local_rank == 0 and _split == "train":
-        dist.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
-
-    return dataset
-
-
 @hydra.main(config_path="conf", config_name="config")
 def main(cfg: DictConfig):
-    if cfg.local_rank == -1 or cfg.no_cuda:
-        device = str(torch.device("cuda" if torch.cuda.is_available() and not cfg.no_cuda else "cpu"))
-        cfg.n_gpu = torch.cuda.device_count()
-    else:  # Initializes the distributed backend which will take care of synchronizing nodes/GPUs
-        torch.cuda.set_device(cfg.local_rank)
-        device = str(torch.device("cuda", cfg.local_rank))
-        dist.init_process_group(backend='nccl')
-        cfg.n_gpu = 1
-        cfg.world_size = dist.get_world_size()
-    cfg.device = device
+    if hasattr(cfg, "dist_init"):
+        hydra.utils.instantiate(cfg.dist_init, cfg)
+    else:
+        vanilla_torch_dist(cfg)
 
     global logger
     logger = setting_logger(cfg.output_dir, local_rank=cfg.local_rank)
     logger.warning("Process rank: %s, device: %s, n_gpu: %s, distributed training: %s, 16-bits training: %s",
-                   cfg.local_rank, device, cfg.n_gpu, bool(cfg.local_rank != -1), cfg.fp16)
+                   cfg.local_rank, cfg.device, cfg.n_gpu, bool(cfg.local_rank != -1), cfg.fp16)
 
     # Set seed
     set_seed(cfg)
@@ -434,7 +355,7 @@ def main(cfg: DictConfig):
             split = "dev"
 
             model = hydra.utils.call(cfg.model, checkpoint)
-            model.to(device)
+            model.to(cfg.device)
 
             if cfg.test_file:
                 prefix = f'test' + (f'-{prefix}' if prefix != "" else "")

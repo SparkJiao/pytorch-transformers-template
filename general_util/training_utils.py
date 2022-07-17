@@ -1,9 +1,16 @@
 import random
 from typing import Dict, List
 
+import hydra
 import numpy as np
 import torch
+import torch.distributed as dist
 from omegaconf import DictConfig
+from transformers import PreTrainedTokenizer
+
+from general_util.logger import get_child_logger
+
+logger = get_child_logger("TrainingUtils")
 
 
 def set_seed(args):
@@ -32,10 +39,53 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 
 def batch_to_device(batch: Dict[str, torch.Tensor], device):
+    if "meta_data" in batch:
+        batch.pop("meta_data")
+    if "index" in batch:
+        batch.pop("index")
+
     batch_on_device = {}
     for k, v in batch.items():
         batch_on_device[k] = v.to(device)
     return batch_on_device
+
+
+def load_and_cache_examples(cfg, tokenizer: PreTrainedTokenizer, _split="train"):
+    if_barrier = False
+
+    if _split == "train":
+        input_file = cfg.train_file
+        if_barrier = True
+    elif _split == "dev":
+        input_file = cfg.dev_file
+        if cfg.ddp_eval and cfg.local_rank != -1:
+            if_barrier = True
+    elif _split == "test":
+        input_file = cfg.test_file
+        if cfg.ddp_eval and cfg.local_rank != -1:
+            if_barrier = True
+    else:
+        raise RuntimeError(_split)
+
+    if if_barrier and cfg.local_rank not in [-1, 0]:
+        dist.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
+
+    sub_config = f"read_tensor_{_split}"
+    if sub_config in cfg:
+        dataset = hydra.utils.call(cfg[sub_config], file_path=input_file, tokenizer=tokenizer)
+    else:
+        dataset = hydra.utils.call(cfg.read_tensor, file_path=input_file, tokenizer=tokenizer)
+
+    if if_barrier and cfg.local_rank == 0:
+        dist.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
+
+    return dataset
+
+
+def if_cancel_sync(cfg: DictConfig, step: int):
+    if getattr(cfg, "forward_sync", False) is False and (step + 1) % cfg.gradient_accumulation_steps != 0 and cfg.local_rank != -1:
+        return True
+    return False
 
 
 def initialize_optimizer(cfg: DictConfig, grouped_parameters: List[Dict] = None, model: torch.nn.Module = None):
@@ -77,6 +127,20 @@ def initialize_optimizer(cfg: DictConfig, grouped_parameters: List[Dict] = None,
                                   eps=cfg.adam_epsilon,
                                   use_nvlamb=(cfg.use_nvlamb if "use_nvlamb" in cfg else False),
                                   max_grad_norm=cfg.max_grad_norm)
+    elif "optimizer" in cfg and cfg.optimizer and "adafactor" in cfg.optimizer:
+        from transformers.optimization import Adafactor
+
+        optimizer = Adafactor(
+            grouped_parameters,
+            lr=cfg.learning_rate,
+            eps=(1e-30, 1e-3),
+            clip_threshold=1.0,
+            beta1=None,
+            weight_decay=0.0,
+            relative_step=False,
+            scale_parameter=False,
+            warmup_init=False
+        )
     else:
         if "bit_training" in cfg and cfg.bit_training:
             from bitsandbytes.optim import AdamW8bit

@@ -1,7 +1,8 @@
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import torch
+import torch.distributed as dist
 
 from general_util.average_meter import LogMetric, AverageMeter
 from general_util.logger import get_child_logger
@@ -59,3 +60,20 @@ class PredictionMixin:
 
     def get_predict_tensors(self):
         return self.tensor_dict
+
+
+class DistGatherMixin:
+    def gather(self):
+        pass
+
+    @staticmethod
+    def gather_object(objects: List[Any]):
+        output = [None for _ in range(dist.get_world_size())]
+        dist.gather_object(objects,
+                           object_gather_list=output if dist.get_rank() == 0 else None,
+                           dst=0)
+
+        if dist.get_rank() == 0:
+            return output
+        else:
+            return None
