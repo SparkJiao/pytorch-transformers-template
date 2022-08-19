@@ -1,9 +1,7 @@
 # coding=utf-8
 #
-# Copyright 2020 Heinrich Heine University Duesseldorf
+# Copyright 2022 Nanyang Technological University, Fangkai Jiao
 #
-# Part of this code is based on the source code of BERT-DST
-# (arXiv:1907.03040)
 # Part of this code is based on the source code of Transformers
 # (arXiv:1910.03771)
 #
@@ -20,32 +18,32 @@
 # limitations under the License.
 
 import glob
-import json
 import logging
 import os
 import sys
 from typing import Dict, Union
 
 import hydra
-import numpy as np
 import torch
 from fairscale.nn.data_parallel.fully_sharded_data_parallel import FullyShardedDataParallel as FullyShardedDDP
 from fairscale.optim.grad_scaler import ShardedGradScaler
 from omegaconf import DictConfig, OmegaConf
 from torch import distributed as dist
-from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler, TensorDataset)
+from torch.utils.data import (DataLoader, RandomSampler)
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
 from transformers import (get_linear_schedule_with_warmup, AutoTokenizer, PreTrainedTokenizer)
 
+from general_util.dist_utils import vanilla_torch_dist
+from general_util.evaluator import evaluate
 from general_util.logger import setting_logger
 from general_util.training_utils import batch_to_device, unwrap_model, set_seed, note_best_checkpoint, initialize_optimizer, \
-    load_and_cache_examples
-from general_util.evaluator import evaluate
-from general_util.dist_utils import vanilla_torch_dist
+    load_and_cache_examples, if_cancel_sync
 
 logger: logging.Logger
+
+torch.backends.cuda.matmul.allow_tf32 = True
 
 
 def save_model(model: Union[torch.nn.Module, FullyShardedDDP], cfg: DictConfig, output_dir: str, tokenizer: PreTrainedTokenizer = None):
@@ -67,7 +65,7 @@ def save_model(model: Union[torch.nn.Module, FullyShardedDDP], cfg: DictConfig, 
 
 def forward_step(model, inputs: Dict[str, torch.Tensor], cfg, scaler, return_outputs: bool = False):
     if cfg.fp16:
-        with torch.cuda.amp.autocast():
+        with torch.cuda.amp.autocast(dtype=(torch.bfloat16 if getattr(cfg, "fp16_bfloat16", False) else torch.float16)):
             outputs = model(**inputs)
     else:
         outputs = model(**inputs)
@@ -105,7 +103,8 @@ def train(cfg, train_dataset, model, tokenizer, continue_from_global_step=0):
         tb_writer = None
         tb_helper = None
 
-    cfg.train_batch_size = cfg.per_gpu_train_batch_size * max(1, cfg.n_gpu)
+    # cfg.train_batch_size = cfg.per_gpu_train_batch_size * max(1, cfg.n_gpu)
+    cfg.train_batch_size = cfg.per_gpu_train_batch_size
     train_sampler = RandomSampler(train_dataset) if cfg.local_rank == -1 else DistributedSampler(train_dataset)
     train_collator = hydra.utils.instantiate(cfg.collator) if "collator" in cfg and cfg.collator else None
     train_dataloader = DataLoader(dataset=train_dataset,
@@ -178,8 +177,8 @@ def train(cfg, train_dataset, model, tokenizer, continue_from_global_step=0):
             train_dataloader.sampler.set_epoch(epoch)
 
         for step, batch in enumerate(epoch_iterator):
-            # If training is continued from a checkpoint, fast forward
-            # to the state of that checkpoint.
+            # If training is continued from a checkpoint,
+            # fast-forward to the state of that checkpoint.
             if global_step < continue_from_global_step:
                 if (step + 1) % cfg.gradient_accumulation_steps == 0:
                     scheduler.step()  # Update learning rate schedule
@@ -190,7 +189,7 @@ def train(cfg, train_dataset, model, tokenizer, continue_from_global_step=0):
             batch = batch_to_device(batch, cfg.device)
 
             last_outputs = None
-            if (step + 1) % cfg.gradient_accumulation_steps != 0 and cfg.local_rank != -1:
+            if if_cancel_sync(cfg, step):
                 # Avoid unnecessary DDP synchronization since there will be no backward pass on this example.
                 with model.no_sync():
                     loss = forward_step(model, batch, cfg, scaler)
@@ -259,6 +258,9 @@ def train(cfg, train_dataset, model, tokenizer, continue_from_global_step=0):
                                 OmegaConf.save(cfg, os.path.join(cfg.output_dir, "training_config.yaml"))
                                 logger.info("Saving best model checkpoint to %s", cfg.output_dir)
 
+                del batch
+                del last_outputs
+
             if 0 < cfg.max_steps < global_step:
                 epoch_iterator.close()
                 break
@@ -298,13 +300,22 @@ def main(cfg: DictConfig):
         pretrain_state_dict = None
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name_or_path)
-    model = hydra.utils.call(cfg.model, cfg.model_name_or_path, state_dict=pretrain_state_dict)
+    try:
+        model = hydra.utils.call(cfg.model, cfg.model_name_or_path, state_dict=pretrain_state_dict)
+    except Exception as e:
+        logger.warning(e)
+        model = hydra.utils.call(cfg.model)
 
     if cfg.local_rank == 0:
         dist.barrier()  # Make sure only the first process in distributed training will download model & vocab
 
     if cfg.local_rank == -1:  # For FullyShardedDDP, place the model on cpu first.
-        model.to(cfg.device)
+        if cfg.n_gpu in [0, 1]:
+            model.to(cfg.device)
+        else:
+            # For model parallel (of mT5)
+            logger.info(f"Model Parallel initialization.")
+            model.parallelize(hydra.utils.call(cfg.get_device_map))
 
     # logger.info("Training/evaluation parameters %s", OmegaConf.to_yaml(cfg))
     if cfg.local_rank in [-1, 0] and cfg.do_train:
@@ -329,13 +340,19 @@ def main(cfg: DictConfig):
         #         model.to(args.device)
 
         train_dataset = load_and_cache_examples(cfg, tokenizer, _split="train")
+
+        if getattr(cfg, "do_preprocess", False):
+            return
+
         global_step, tr_loss = train(cfg, train_dataset, model, tokenizer, continue_from_global_step)
         logger.info(" global_step = %s, average loss = %s", global_step, tr_loss)
 
     # Test
     results = {}
-    if cfg.do_eval and cfg.local_rank in [-1, 0]:
-        cfg.ddp_eval = False  # Canceling distributed evaluation since other progresses have already existed.
+    if cfg.do_eval:
+        if not cfg.ddp_eval and cfg.local_rank not in [-1, 0]:
+            return results
+
         checkpoints = [cfg.output_dir]
         if cfg.save_best:
             logging.getLogger("transformers.modeling_utils").setLevel(logging.WARN)  # Reduce logging
@@ -354,8 +371,15 @@ def main(cfg: DictConfig):
             prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
             split = "dev"
 
-            model = hydra.utils.call(cfg.model, checkpoint)
-            model.to(cfg.device)
+            if "model_eval" in cfg:
+                model = hydra.utils.call(cfg.model_eval, checkpoint)
+            else:
+                model = hydra.utils.call(cfg.model, checkpoint)
+            if cfg.n_gpu == 1:
+                model.to(cfg.device)
+            else:
+                # For model parallel (of mT5)
+                model.parallelize(hydra.utils.call(cfg.get_device_map))
 
             if cfg.test_file:
                 prefix = f'test' + (f'-{prefix}' if prefix != "" else "")

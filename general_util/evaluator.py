@@ -1,3 +1,4 @@
+import json
 import os
 
 import hydra
@@ -8,7 +9,6 @@ from transformers import PreTrainedTokenizer
 
 from general_util.logger import get_child_logger
 from general_util.training_utils import batch_to_device, load_and_cache_examples, unwrap_model
-import json
 
 logger = get_child_logger(__name__)
 
