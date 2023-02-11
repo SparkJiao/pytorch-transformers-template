@@ -1,3 +1,4 @@
+import datetime
 import os
 import subprocess
 
@@ -16,7 +17,7 @@ def vanilla_torch_dist(cfg: DictConfig, backend="nccl"):
     else:  # Initializes the distributed backend which will take care of synchronizing nodes/GPUs
         torch.cuda.set_device(cfg.local_rank)
         device = str(torch.device("cuda", cfg.local_rank))
-        dist.init_process_group(backend=backend)
+        dist.init_process_group(backend=backend, timeout=datetime.timedelta(seconds=7200))
         cfg.n_gpu = 1
         cfg.world_size = dist.get_world_size()
     cfg.device = device
@@ -27,6 +28,7 @@ def setup_slurm_distributed(cfg: DictConfig, backend="nccl", port=None):
     Most code are copied from https://github.com/BIGBALLON/distribuuuu/blob/master/tutorial/mnmc_ddp_slurm.py.
     """
     num_gpus = torch.cuda.device_count()
+    print(num_gpus)
     if num_gpus <= 1 or cfg.no_cuda:
         cfg.local_rank = -1
         cfg.device = str(torch.device("cuda" if torch.cuda.is_available() and not cfg.no_cuda else "cpu"))

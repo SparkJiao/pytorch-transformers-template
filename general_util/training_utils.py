@@ -1,5 +1,7 @@
+import glob
 import random
 from typing import Dict, List
+import os
 
 import hydra
 import numpy as np
@@ -46,26 +48,33 @@ def batch_to_device(batch: Dict[str, torch.Tensor], device):
 
     batch_on_device = {}
     for k, v in batch.items():
-        batch_on_device[k] = v.to(device)
+        if isinstance(v, torch.Tensor):
+            batch_on_device[k] = v.to(device)
+        else:
+            batch_on_device[k] = v
     return batch_on_device
 
 
-def load_and_cache_examples(cfg, tokenizer: PreTrainedTokenizer, _split="train"):
+def load_and_cache_examples(cfg, tokenizer: PreTrainedTokenizer, _split="train", _file: str = None):
     if_barrier = False
 
-    if _split == "train":
-        input_file = cfg.train_file
+    if _file is not None:
+        input_file = _file
         if_barrier = True
-    elif _split == "dev":
-        input_file = cfg.dev_file
-        if cfg.ddp_eval and cfg.local_rank != -1:
-            if_barrier = True
-    elif _split == "test":
-        input_file = cfg.test_file
-        if cfg.ddp_eval and cfg.local_rank != -1:
-            if_barrier = True
     else:
-        raise RuntimeError(_split)
+        if _split == "train":
+            input_file = cfg.train_file
+            if_barrier = True
+        elif _split == "dev":
+            input_file = cfg.dev_file
+            if cfg.ddp_eval and cfg.local_rank != -1:
+                if_barrier = True
+        elif _split == "test":
+            input_file = cfg.test_file
+            if cfg.ddp_eval and cfg.local_rank != -1:
+                if_barrier = True
+        else:
+            raise RuntimeError(_split)
 
     if if_barrier and cfg.local_rank not in [-1, 0]:
         dist.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
@@ -79,11 +88,15 @@ def load_and_cache_examples(cfg, tokenizer: PreTrainedTokenizer, _split="train")
     if if_barrier and cfg.local_rank == 0:
         dist.barrier()  # Make sure only the first process in distributed training process the dataset, and the others will use the cache
 
+    if dist.is_initialized():
+        dist.barrier()
+
     return dataset
 
 
 def if_cancel_sync(cfg: DictConfig, step: int):
-    if getattr(cfg, "forward_sync", False) is False and (step + 1) % cfg.gradient_accumulation_steps != 0 and cfg.local_rank != -1:
+    if getattr(cfg, "forward_sync", False) is False and (
+            step + 1) % cfg.gradient_accumulation_steps != 0 and cfg.local_rank != -1:
         return True
     return False
 
@@ -94,11 +107,13 @@ def initialize_optimizer(cfg: DictConfig, grouped_parameters: List[Dict] = None,
         no_decay = ['bias', 'LayerNorm.weight', 'layer_norm.weight']
         grouped_parameters = [
             {
-                'params': [p for n, p in model.named_parameters() if (not any(nd in n for nd in no_decay)) and p.requires_grad],
+                'params': [p for n, p in model.named_parameters() if
+                           (not any(nd in n for nd in no_decay)) and p.requires_grad],
                 'weight_decay': cfg.weight_decay
             },
             {
-                'params': [p for n, p in model.named_parameters() if (any(nd in n for nd in no_decay)) and p.requires_grad],
+                'params': [p for n, p in model.named_parameters() if
+                           (any(nd in n for nd in no_decay)) and p.requires_grad],
                 'weight_decay': 0.0
             }
         ]
@@ -145,21 +160,48 @@ def initialize_optimizer(cfg: DictConfig, grouped_parameters: List[Dict] = None,
         if "bit_training" in cfg and cfg.bit_training:
             from bitsandbytes.optim import AdamW8bit
 
-            optimizer = AdamW8bit(grouped_parameters, lr=cfg.learning_rate, eps=cfg.adam_epsilon, betas=(eval(cfg.adam_betas)))
+            optimizer = AdamW8bit(grouped_parameters, lr=cfg.learning_rate, eps=cfg.adam_epsilon,
+                                  betas=(eval(cfg.adam_betas)))
         else:
             if hasattr(cfg, "multi_tensor") and cfg.multi_tensor:
                 from torch.optim._multi_tensor import AdamW
             else:
                 from torch.optim.adamw import AdamW
 
-            optimizer = AdamW(grouped_parameters, lr=cfg.learning_rate, eps=cfg.adam_epsilon, betas=(eval(cfg.adam_betas)))
+            optimizer = AdamW(grouped_parameters, lr=cfg.learning_rate, eps=cfg.adam_epsilon,
+                              betas=(eval(cfg.adam_betas)))
 
     return optimizer
 
 
+def initialize_lr_scheduler(cfg: DictConfig, optimizer, num_warmup_steps: int, num_training_steps: int):
+    if hasattr(cfg, "lr_scheduler"):
+        if cfg.lr_scheduler == "linear":
+            from transformers import get_linear_schedule_with_warmup
+
+            lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
+        elif cfg.lr_scheduler == "cosine":
+            from transformers import get_cosine_schedule_with_warmup
+
+            lr_scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
+        elif cfg.lr_scheduler == "constant":
+            from transformers import get_constant_schedule_with_warmup
+
+            lr_scheduler = get_constant_schedule_with_warmup(optimizer, num_warmup_steps)
+        else:
+            raise NotImplementedError()
+    else:
+        from transformers import get_linear_schedule_with_warmup
+
+        lr_scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps)
+
+    return lr_scheduler
+
+
 def note_best_checkpoint(cfg: DictConfig, results: Dict[str, float], sub_path: str):
     metric = results[cfg.prediction_cfg.metric]
-    if (not cfg.prediction_cfg.best_result) or (cfg.prediction_cfg.measure > 0 and metric > cfg.prediction_cfg.best_result) or (
+    if (not cfg.prediction_cfg.best_result) or (
+            cfg.prediction_cfg.measure > 0 and metric > cfg.prediction_cfg.best_result) or (
             cfg.prediction_cfg.measure < 0 and metric < cfg.prediction_cfg.best_result):
         cfg.prediction_cfg.best_result = metric
         cfg.prediction_cfg.best_checkpoint = sub_path
